@@ -1,0 +1,8 @@
+[submodule "sample-ERP/sample-ERP"]
+	path = sample-ERP/sample-ERP
+	url = https://github.com/raulbattistini3-sys/sample-ERP.git
+	branch = feat/telemetry-updates
+[submodule "tcc-v2/tcc-v1"]
+	path = tcc-v2/tcc-v1
+	url = git@github.com:raulbattistini3-sys/tcc-v1.git
+	branch = docs/clarification-thesis

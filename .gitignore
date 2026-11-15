@@ -1,0 +1,19 @@
+# secrets/generate.ts output: tokens, the JWT key, the mTLS certificates and the vault keys.
+# Only the generator is tracked.
+/secrets/*
+!/secrets/generate.ts
+!/secrets/network-token.ts
+!/secrets/package.json
+!/secrets/bun.lock
+!/secrets/tsconfig.json
+!/secrets/README.md
+
+# the launcher's build and its output (cargo xtask dist)
+/launcher/target/
+/bin/
+
+# local runtime state
+/cache/
+/data/
+node_modules/
+target/
