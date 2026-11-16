@@ -216,8 +216,31 @@ func (s *Supervisor) watchGroup() {
 			ev.Detail = "the application's memoryBudget " + s.app.Resources.MemoryBudget.String()
 		}
 		s.emit(ev)
+		if u != nil && e.Kind != "soft-limit" {
+			go s.reapStuck(u)
+		}
 	}
 }
+
+// reapStuck: the job refuses allocations past the hard limit, but a runtime may not exit on that: it
+// collects again and again at the cap (a GC'd heap that cannot grow), serving nothing. One that freed
+// memory keeps running; one still at the limit after hardLimitGrace is killed, and its restart policy
+// applies, as for an out-of-memory exit.
+func (s *Supervisor) reapStuck(u *unit) {
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-time.After(hardLimitGrace):
+	}
+	hard := uint64(u.svc.Memory.HardLimit)
+	if hard == 0 || u.usage().MemoryBytes < hard/100*98 {
+		return
+	}
+	u.emit("killed", 0, "still at the hard limit after "+hardLimitGrace.String(), nil)
+	u.kill()
+}
+
+const hardLimitGrace = 3 * time.Second
 
 // sample reads each running service's usage and reports pressure changes: elevated from the soft limit,
 // critical from 95% of the hard limit.

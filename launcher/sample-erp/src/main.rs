@@ -353,9 +353,17 @@ async fn run_stack(
             ("TCC_INGEST_DATABASE_CA_CERT", cfg.tcc_ca()),
         ]));
     }
+    // the background worker: the same api.exe with API_ROLE=worker runs the pg-boss consumers in its own
+    // process (and job object), so their allocations never reach the API's heap; the API only produces
+    let mut worker_env = api_env.clone();
+    worker_env.push(("API_ROLE".into(), "worker".into()));
+    worker_env.push(("TELEMETRY_INSTANCE_ID".into(), "worker-launcher".into()));
+    worker_env.extend(bun_heap(cfg.memory_mb("worker")));
+    api_env.push(("API_ROLE".into(), "api".into()));
     api_env.extend(joins("api"));
     api_env.extend(bun_heap(cfg.memory_mb("api")));
     specs.push(Spec { name: "api", memory_mb: cfg.memory_mb("api"), program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() });
+    specs.push(Spec { name: "worker", memory_mb: cfg.memory_mb("worker"), program: paths.api(), args: vec![], env: worker_env, cwd: cwd.clone() });
 
     // erp-cache: the read cache (erp-v1/cache) in front of the API (site "erp", registered as api-cache,
     // which the gateway's /api goes to) and the TCC server (site "tcc", which also answers resent

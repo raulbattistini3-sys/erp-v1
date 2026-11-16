@@ -36,6 +36,11 @@ pub fn write_config(paths: &Paths, cfg: &Config, specs: &[Spec]) -> Result<PathB
             // the launcher waits 20 s for polyvisor itself; each service gets less, so a clean stop is the norm
             "stop": { "grace": "15s" },
         });
+        // bun services shut down on CTRL_BREAK sent to their own process group (SIGBREAK); without a
+        // signal polyvisor can only kill the tree on Windows
+        if matches!(s.name, "api" | "worker" | "tcc") {
+            svc["stop"]["signal"] = json!("break");
+        }
         if s.memory_mb > 0 {
             budget_mb += s.memory_mb;
             // pressure is reported (and the runtime sheds) from 80%; the job object kills at the hard limit
@@ -48,6 +53,10 @@ pub fn write_config(paths: &Paths, cfg: &Config, specs: &[Spec]) -> Result<PathB
         }
         if s.name == "importer" {
             svc["scheduling"] = json!({ "priority": "background" });
+        }
+        if s.name == "worker" {
+            // POLYVISOR_MAX_CONCURRENCY: jobs at once per queue; pressure pauses it at critical
+            svc["scheduling"] = json!({ "priority": "background", "maxConcurrency": 3 });
         }
         services.insert(s.name.to_string(), svc);
     }
@@ -86,6 +95,8 @@ fn depends_on(name: &str, present: &[&str]) -> Vec<&'static str> {
         "network" => &[],
         "api" => &["network", "tcc", "vault", "importer"],
         "cache" => &["network", "api"],
+        // after the API: the queues' schema is created by the API's pg-boss start
+        "worker" => &["network", "vault", "api"],
         _ => &["network"],
     };
     wanted.iter().copied().filter(|d| present.contains(d)).collect()

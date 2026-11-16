@@ -277,7 +277,7 @@ impl Config {
             polyvisor: flag(&vars, "ERP_POLYVISOR", true),
             // convo2.json: API heap 768 MB, TCC server 384 MB, billing -Xmx512m + metaspace + direct
             // buffers; the limit is the whole process (heap plus native), so it sits above the heap
-            memory_mb: [("api", 1024.0), ("tcc", 512.0), ("billing", 1024.0), ("cache", 256.0), ("network", 0.0), ("importer", 0.0), ("vault", 0.0)]
+            memory_mb: [("api", 1024.0), ("tcc", 512.0), ("billing", 1024.0), ("cache", 256.0), ("worker", 384.0), ("network", 0.0), ("importer", 0.0), ("vault", 0.0)]
                 .into_iter()
                 .map(|(name, default)| {
                     let key = format!("ERP_{}_MEMORY_MB", name.to_uppercase());

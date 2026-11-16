@@ -100,7 +100,7 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool, cache: bool, polyviso
     let api = repo.join("api");
     run(Command::new(tool("bun")).args(["install", "--frozen-lockfile"]).current_dir(&api))?;
     run(Command::new(tool("bun"))
-        .args(["build", "--compile", "--minify-syntax", "src/index.ts", "--outfile"])
+        .args(["build", "--compile", "--minify-syntax", "src/entry.ts", "--outfile"])
         .arg(services.join(format!("api{EXE}")))
         .current_dir(&api))?;
 
