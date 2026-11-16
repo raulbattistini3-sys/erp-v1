@@ -4,6 +4,7 @@
 //!   erp-v1/sample-ERP/sample-ERP   the ERP (web, api, importer, vault, network, billing)
 //!   erp-v1/tcc-v2/tcc-v1           the TCC (demo-monorepo-workspace: server + dashboard)
 //!
+//!   polivisor go build (erp-v1/polivisor) → polivisor.exe beside the launcher: starts, caps and restarts services/
 //!   web      vite build (bun) → web/dist, embedded into the launcher
 //!   api      bun build --compile → services/api.exe, Bun runtime included
 //!   importer go build → services/importer.exe
@@ -80,6 +81,15 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
     let services = out.join("services");
     fs::create_dir_all(&services)?;
     fs::create_dir_all(out.join("config"))?;
+
+    // the supervisor first: stdlib Go, no cgo, independent of the ERP checkout
+    step("polivisor: go build");
+    run(Command::new(tool("go"))
+        .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
+        .arg(out.join(format!("polivisor{EXE}")))
+        .arg("./cmd/polivisor")
+        .env("CGO_ENABLED", "0")
+        .current_dir(root.join("polivisor")))?;
 
     step("web: vite build");
     let web = repo.join("web");

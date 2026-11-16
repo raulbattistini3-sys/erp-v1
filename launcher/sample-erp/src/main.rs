@@ -10,21 +10,21 @@
 mod certs;
 mod config;
 mod db;
-mod services;
+mod polivisor;
 mod web;
 #[cfg(windows)]
 mod windows;
 
 use anyhow::{Context, Result, bail};
 use config::{Config, Paths};
-use services::{Spec, State};
+use polivisor::{Spec, Unit};
 use std::{
     io::Write,
     net::{Ipv4Addr, TcpListener as StdListener},
     process::ExitCode,
     time::Duration,
 };
-use tokio::{net::TcpStream, sync::watch, task::JoinSet};
+use tokio::net::TcpStream;
 
 /// One line of output, prefixed with where it came from.
 pub fn log(source: &str, line: &str) {
@@ -69,6 +69,7 @@ async fn run(paths: &Paths, cfg: Config) -> Result<()> {
     windows::kill_children_with_launcher();
 
     for (bin, what) in [
+        (paths.polivisor(), "the polivisor"),
         (paths.api(), "the API"),
         (paths.importer(), "the importer"),
         (paths.network(), "the network service"),
@@ -99,6 +100,7 @@ async fn run(paths: &Paths, cfg: Config) -> Result<()> {
         ("ERP_API_PORT", cfg.api_port),
         ("ERP_NETWORK_PORT", cfg.network_port),
         ("ERP_VAULT_PORT", cfg.vault_port),
+        ("ERP_POLIVISOR_PORT", cfg.polivisor_port),
     ];
     if billing {
         ports.push(("ERP_BILLING_PORT", cfg.billing_port));
@@ -137,8 +139,7 @@ async fn run_stack(
 ) -> Result<()> {
     db::prepare(pg, cfg, tcc).await?;
 
-    let (state_tx, state_rx) = watch::channel(State::Running);
-    let mut tasks = JoinSet::new();
+    let mut units: Vec<Unit> = Vec::new();
     let secrets = &cfg.secrets;
     let cwd = paths.data.clone();
     let owned = |pairs: &[(&str, String)]| -> Vec<(String, String)> {
@@ -182,10 +183,12 @@ async fn run_stack(
             network_env.push((k, v));
         }
     }
-    tasks.spawn(services::supervise(
-        Spec { name: "network", program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    // tier 0 with the TCC and the vault: everything registers on it, so it is critical
+    units.push(Unit {
+        spec: Spec { name: "network", program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() },
+        depends_on: &[], after: &[], ready_port: Some(cfg.network_port), critical: true,
+        memory_mb: 256, min_free_mb: 0, runtime: "go", heap_mb: 0,
+    });
     let joins = |name: &str| -> Vec<(String, String)> {
         owned(&[
             ("NETWORK_URL", network_url.clone()),
@@ -202,8 +205,8 @@ async fn run_stack(
     if tcc {
         let dir = paths.data.join("tcc");
         std::fs::create_dir_all(&dir)?;
-        tasks.spawn(services::supervise(
-            Spec {
+        units.push(Unit {
+            spec: Spec {
                 name: "tcc",
                 program: paths.tcc(),
                 args: vec![],
@@ -227,13 +230,14 @@ async fn run_stack(
                 .concat(),
                 cwd: dir,
             },
-            state_rx.clone(),
-        ));
+            depends_on: &[], after: &[], ready_port: Some(cfg.tcc_port), critical: false,
+            memory_mb: 512, min_free_mb: 128, runtime: "bun", heap_mb: 0,
+        });
     }
 
     // importer: reads, validates and saves product spreadsheets queued in the importacoes table
-    tasks.spawn(services::supervise(
-        Spec {
+    units.push(Unit {
+        spec: Spec {
             name: "importer",
             program: paths.importer(),
             args: vec![],
@@ -256,8 +260,10 @@ async fn run_stack(
             .collect(),
             cwd: cwd.clone(),
         },
-        state_rx.clone(),
-    ));
+        // the API triggers imports: it starts once the API is up
+        depends_on: &["api"], after: &[], ready_port: Some(cfg.importer_port), critical: false,
+        memory_mb: 512, min_free_mb: 256, runtime: "go", heap_mb: 0,
+    });
 
     // vault: the usuarios' CPF and birth dates, AES-256-GCM under keys in data/vault-keys. On Windows the
     // keys are DPAPI blobs bound to this Windows account: the folder copied to another machine or user
@@ -268,8 +274,8 @@ async fn run_stack(
         use sha2::{Digest, Sha256};
         Sha256::digest(secrets.vault_token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    tasks.spawn(services::supervise(
-        Spec {
+    units.push(Unit {
+        spec: Spec {
             name: "vault",
             program: paths.vault(),
             args: vec!["serve".into()],
@@ -290,8 +296,9 @@ async fn run_stack(
             ]),
             cwd: cwd.clone(),
         },
-        state_rx.clone(),
-    ));
+        depends_on: &[], after: &[], ready_port: Some(cfg.vault_port), critical: true,
+        memory_mb: 128, min_free_mb: 0, runtime: "go", heap_mb: 0,
+    });
 
     // api: defaults, then config/api.env, then what the launcher owns (as in docker-compose.yml, the
     // database, host/port, URLs and CORS always win over the file)
@@ -348,10 +355,12 @@ async fn run_stack(
         ]));
     }
     api_env.extend(joins("api"));
-    tasks.spawn(services::supervise(
-        Spec { name: "api", program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    // bun-compiled (JavaScriptCore): V8 heap flags don't apply, the job cap is its limit
+    units.push(Unit {
+        spec: Spec { name: "api", program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() },
+        depends_on: &["network", "vault"], after: &["tcc"], ready_port: Some(cfg.api_port), critical: true,
+        memory_mb: 1024, min_free_mb: 384, runtime: "bun", heap_mb: 0,
+    });
 
     // billing: Stripe webhooks; its Flyway migrations run in the billing schema of the same database
     if billing {
@@ -371,16 +380,17 @@ async fn run_stack(
             ("SERVER_FORWARD_HEADERS_STRATEGY", "framework".into()),
         ]));
         env.extend(joins("billing"));
-        tasks.spawn(services::supervise(
-            Spec {
+        units.push(Unit {
+            spec: Spec {
                 name: "billing",
                 program: paths.billing_java(),
                 args: vec!["-jar".into(), paths.billing_jar().to_string_lossy().into_owned()],
                 env,
                 cwd: cwd.clone(),
             },
-            state_rx.clone(),
-        ));
+            depends_on: &["api"], after: &[], ready_port: Some(cfg.billing_port), critical: false,
+            memory_mb: 896, min_free_mb: 512, runtime: "java", heap_mb: 512,
+        });
     }
 
     let banner = {
@@ -421,20 +431,15 @@ async fn run_stack(
         })
     };
 
-    let outcome = match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            log("launcher", "stopping (Ctrl+C)");
-            State::Interrupted
-        }
-        Err(e) => {
-            log("launcher", &format!("cannot wait for Ctrl+C ({e}); stopping"));
-            State::Aborted
-        }
-    };
+    let config = paths.data.join("polivisor.json");
+    polivisor::write_config(&config, cfg.polivisor_port, 20, &units)?;
+    log(
+        "launcher",
+        &format!("handing {} services to the polivisor (status: polivisor status --addr 127.0.0.1:{})", units.len(), cfg.polivisor_port),
+    );
+    let result = polivisor::run(&paths.polivisor(), &config).await;
     banner.abort();
-    let _ = state_tx.send(outcome);
-    while tasks.join_next().await.is_some() {}
-    Ok(())
+    result
 }
 
 async fn wait_for_port(port: u16, limit: Duration) -> bool {

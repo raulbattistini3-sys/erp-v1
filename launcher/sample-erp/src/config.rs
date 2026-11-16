@@ -55,6 +55,11 @@ impl Paths {
         self.services.join(format!("network{EXE}"))
     }
 
+    /// The polivisor (erp-v1/polivisor, Go): beside the launcher, it starts and supervises everything in services/.
+    pub fn polivisor(&self) -> PathBuf {
+        self.services.parent().unwrap_or(&self.services).join(format!("polivisor{EXE}"))
+    }
+
     /// The vault (vault/, Go): the encrypted CPF and birth dates, in its own database.
     pub fn vault(&self) -> PathBuf {
         self.services.join(format!("vault{EXE}"))
@@ -111,6 +116,8 @@ pub struct Config {
     pub network_port: u16,
     /// The vault's HTTPS port, loopback only.
     pub vault_port: u16,
+    /// The polivisor's control/status port, loopback only.
+    pub polivisor_port: u16,
     /// The TCC server's port (API ingest + dashboard), loopback only.
     pub tcc_port: u16,
     /// ERP_TCC=off: don't start the TCC even when services/tcc is there.
@@ -233,6 +240,7 @@ impl Config {
             billing_port: port("ERP_BILLING_PORT", 8081)?,
             network_port: port("ERP_NETWORK_PORT", 7070)?,
             vault_port: port("ERP_VAULT_PORT", 8200)?,
+            polivisor_port: port("ERP_POLIVISOR_PORT", 9900)?,
             // the same port as `pnpm dev` in the TCC workspace, so the extension's settings keep working
             tcc_port: port("ERP_TCC_PORT", 8787)?,
             tcc: flag(&vars, "ERP_TCC", true),
