@@ -40,13 +40,22 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
     let mut backoff = Duration::from_secs(2);
     #[allow(unused_mut, unused_variables)]
     let mut limited = false;
+    #[allow(unused_mut, unused_variables)]
+    let mut starts = 0u32;
     loop {
         if *state.borrow() != State::Running {
             return;
         }
+        // the memory-limit job's name, handed to the service so its telemetry can read the job
+        #[cfg(windows)]
+        let job = (spec.memory_mb > 0).then(|| crate::windows::job_name(spec.name, starts));
+        #[cfg(not(windows))]
+        let job: Option<String> = None;
+        starts += 1;
         let mut child = match Command::new(&spec.program)
             .args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .envs(job.iter().map(|n| ("WIN_TELEMETRY_JOB", n)))
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -62,17 +71,24 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
         };
         forward(spec.name, child.stdout.take());
         forward(spec.name, child.stderr.take());
+        // held until the child is gone: the job's name (WIN_TELEMETRY_JOB) lasts only while a handle does
         #[cfg(windows)]
-        if spec.memory_mb > 0 {
-            if let Some(pid) = child.id() {
-                if let Err(e) = crate::windows::limit_memory(pid, spec.memory_mb) {
+        let _job = match child.id().filter(|_| spec.memory_mb > 0) {
+            None => None,
+            Some(pid) => match crate::windows::limit_memory(pid, spec.memory_mb, job.as_deref()) {
+                Err(e) => {
                     crate::log(spec.name, &format!("memory limit of {} MB not applied: {e}", spec.memory_mb));
-                } else if !limited {
-                    crate::log(spec.name, &format!("memory limit {} MB (job object)", spec.memory_mb));
-                    limited = true;
+                    None
                 }
-            }
-        }
+                Ok(handle) => {
+                    if !limited {
+                        crate::log(spec.name, &format!("memory limit {} MB (job object)", spec.memory_mb));
+                        limited = true;
+                    }
+                    Some(handle)
+                }
+            },
+        };
         let started = Instant::now();
 
         tokio::select! {
