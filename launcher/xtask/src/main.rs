@@ -12,8 +12,8 @@
 //!   billing  mvnw package + jlink → services/billing/{billing.jar, runtime/} (a trimmed JRE)
 //!   tcc      pnpm install, the C++ addon (optional), vite build of the dashboard, bun build --compile
 //!            → services/tcc/{tcc-v2.exe, web/, win_telemetry.node}
-//!   cache    go build (erp-v1/cache) → services/erp-cache.exe, cache.example.json → services/cache.json
-//!   polyvisor go build (erp-v1/supervisor) → services/polyvisor/polyvisor.exe, the supervisor the launcher
+//!   cache    go build (erp-v1/cache) → services/cache/{erp-cache.exe, cache.json}
+//!   polyvisor go build (erp-v1/supervisor) → polyvisor.exe beside sample-erp.exe, the supervisor the launcher
 //!            hands the services to, + runtime/ (adaptive admission JS + polyvisor.node, C++, optional)
 //!   launcher cargo build --release → sample-erp.exe, with the web app, SQL and migrations (ERP and TCC) inside
 //!
@@ -141,17 +141,24 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool, cache: bool, polyviso
     }
 
     if cache {
-        build_cache(&root.join("cache"), &services)?;
+        build_cache(&root.join("cache"), &services.join("cache"))?;
+        // older dists left it loose in services/
+        let _ = fs::remove_file(services.join(format!("erp-cache{EXE}")));
+        let _ = fs::remove_file(services.join("cache.json"));
     } else {
         step("cache: skipped (--no-cache)");
     }
 
     if polyvisor {
-        build_polyvisor(&root.join("supervisor"), &services.join("polyvisor"))?;
+        // the entry the launcher hands the stack to: polyvisor.exe beside sample-erp.exe, its runtime in runtime/
+        build_polyvisor(&root.join("supervisor"), out)?;
+        let _ = fs::remove_dir_all(services.join("polyvisor"));
     } else {
         step("polyvisor: skipped (--no-polyvisor)");
         // a stale one would still be picked up by the launcher
         let _ = fs::remove_dir_all(services.join("polyvisor"));
+        let _ = fs::remove_file(out.join(format!("polyvisor{EXE}")));
+        let _ = fs::remove_dir_all(out.join("runtime"));
     }
 
     step("launcher: cargo build --release");
@@ -256,15 +263,16 @@ fn build_tcc(workspace: &Path, dest: &Path) -> Result<()> {
 
 /// erp-cache, the root's own Go module: the read cache in front of the API and the TCC server. Its
 /// cache.json is the example as is; the launcher hands it ports, upstreams and databases by env.
-fn build_cache(module: &Path, services: &Path) -> Result<()> {
+fn build_cache(module: &Path, dest: &Path) -> Result<()> {
     step("cache: go build");
+    fs::create_dir_all(dest)?;
     run(Command::new(tool("go"))
         .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
-        .arg(services.join(format!("erp-cache{EXE}")))
+        .arg(dest.join(format!("erp-cache{EXE}")))
         .arg("./cmd/erp-cache")
         .env("CGO_ENABLED", "0")
         .current_dir(module))?;
-    copy(&module.join("cache.example.json"), &services.join("cache.json"))
+    copy(&module.join("cache.example.json"), &dest.join("cache.json"))
 }
 
 /// polyvisor, the root's supervisor (Go) and its service-side runtime. The addon (polyvisor.node, Windows)

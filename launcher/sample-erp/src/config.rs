@@ -85,12 +85,12 @@ impl Paths {
 
     /// erp-cache (erp-v1/cache, Go): the read cache in front of the API and the TCC server
     pub fn cache(&self) -> PathBuf {
-        self.services.join(format!("erp-cache{EXE}"))
+        self.services.join("cache").join(format!("erp-cache{EXE}"))
     }
 
     /// Its sites, routes and tables (cache.example.json); ports and URLs come from the launcher
     pub fn cache_config(&self) -> PathBuf {
-        self.services.join("cache.json")
+        self.services.join("cache").join("cache.json")
     }
 
     /// The TCC dashboard (apps/web/dist, built with VITE_API_URL=""), served by tcc-v2.exe at /
@@ -100,13 +100,13 @@ impl Paths {
 
     /// polyvisor (erp-v1/supervisor, Go): when present the launcher runs the stack under it
     pub fn polyvisor(&self) -> PathBuf {
-        self.services.join("polyvisor").join(format!("polyvisor{EXE}"))
+        self.services.parent().unwrap_or(&self.services).join(format!("polyvisor{EXE}"))
     }
 
     /// polyvisor's service-side runtime (adaptive admission + polyvisor.node), given to services as
     /// POLYVISOR_RUNTIME
     pub fn polyvisor_runtime(&self) -> PathBuf {
-        self.services.join("polyvisor").join("runtime")
+        self.services.parent().unwrap_or(&self.services).join("runtime")
     }
 }
 
@@ -141,10 +141,10 @@ pub struct Config {
     pub cache_port: u16,
     pub cache_tcc_port: u16,
     pub cache_control_port: u16,
-    /// ERP_CACHE=off: don't start erp-cache even when services/erp-cache.exe is there; /api then goes
+    /// ERP_CACHE=off: don't start erp-cache even when services/cache/erp-cache.exe is there; /api then goes
     /// straight to the API.
     pub cache: bool,
-    /// ERP_POLYVISOR=off: supervise the services from the launcher even when services/polyvisor is there.
+    /// ERP_POLYVISOR=off: supervise the services from the launcher even when polyvisor.exe is there.
     pub polyvisor: bool,
     /// Per-service memory limits in MB (ERP_<SERVICE>_MEMORY_MB; 0 = none), enforced by a job object
     /// per service. The Bun executables ignore --max-old-space-size, so this is their only bound.

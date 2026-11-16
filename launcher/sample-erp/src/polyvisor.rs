@@ -4,7 +4,7 @@
 //! `Spec`s built in main.rs); polyvisor decides *how*: one job object over the whole application, a named
 //! job per service created suspended (so a child it forks, such as the API's tcc-v2.exe ingest process, is
 //! inside the limit from its first instruction), start order by readiness, restarts, memory-pressure events
-//! and admission. Without services/polyvisor/polyvisor.exe the launcher supervises the Specs itself.
+//! and admission. Without polyvisor.exe (beside sample-erp.exe) the launcher supervises the Specs itself.
 
 use crate::config::{Config, Paths};
 use crate::services::Spec;
