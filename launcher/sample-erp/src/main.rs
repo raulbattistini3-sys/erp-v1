@@ -375,7 +375,12 @@ async fn run_stack(
             Spec {
                 name: "billing",
                 program: paths.billing_java(),
-                args: vec!["-jar".into(), paths.billing_jar().to_string_lossy().into_owned()],
+                // JVM limits before -jar (heap, metaspace, direct buffers); the job object is the final bound
+                args: ["-Xms128m", "-Xmx512m", "-XX:MaxMetaspaceSize=192m", "-XX:MaxDirectMemorySize=128m", "-jar"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain([paths.billing_jar().to_string_lossy().into_owned()])
+                    .collect(),
                 env,
                 cwd: cwd.clone(),
             },
