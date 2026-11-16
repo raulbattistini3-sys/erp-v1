@@ -12,6 +12,8 @@
       "listen": "127.0.0.1:10080",
       "upstream": "http://127.0.0.1:10000",
       "databaseUrlEnv": "ERP_CACHE_DATABASE_URL",
+      "databaseCaCertEnv": "ERP_CACHE_DATABASE_CA_CERT",
+      "register": "api-cache",
       "channel": "erp_cache",
       "maxEntries": 10000,
       "maxBytes": 67108864,

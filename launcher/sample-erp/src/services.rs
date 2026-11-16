@@ -19,6 +19,10 @@ pub struct Spec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
+    /// Memory limit of the process in MB (0: none): on Windows a job object of its own with
+    /// JOB_OBJECT_LIMIT_PROCESS_MEMORY, nested in the launcher's kill-on-close job. An allocation over
+    /// it fails, the service dies and is restarted like any other crash.
+    pub memory_mb: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,6 +38,8 @@ const GRACE: Duration = Duration::from_secs(20);
 
 pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
     let mut backoff = Duration::from_secs(2);
+    #[allow(unused_mut, unused_variables)]
+    let mut limited = false;
     loop {
         if *state.borrow() != State::Running {
             return;
@@ -56,6 +62,17 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
         };
         forward(spec.name, child.stdout.take());
         forward(spec.name, child.stderr.take());
+        #[cfg(windows)]
+        if spec.memory_mb > 0 {
+            if let Some(pid) = child.id() {
+                if let Err(e) = crate::windows::limit_memory(pid, spec.memory_mb) {
+                    crate::log(spec.name, &format!("memory limit of {} MB not applied: {e}", spec.memory_mb));
+                } else if !limited {
+                    crate::log(spec.name, &format!("memory limit {} MB (job object)", spec.memory_mb));
+                    limited = true;
+                }
+            }
+        }
         let started = Instant::now();
 
         tokio::select! {

@@ -100,6 +100,15 @@ func serve(cfg *config.Config, log *slog.Logger) error {
 			if sc.DatabaseCACertEnv != "" {
 				ca = os.Getenv(sc.DatabaseCACertEnv)
 			}
+			// CACHE_INSTALL_TRIGGERS=1 (the launcher): the feed's triggers are installed at start, on the
+			// tables that exist, instead of with a separate `erp-cache triggers -apply`
+			if os.Getenv("CACHE_INSTALL_TRIGGERS") == "1" {
+				if n, err := installTriggers(ctx, dbURL, ca, sc.Channel, sc.Tables()); err != nil {
+					log.Warn("triggers not installed: entries are only dropped by TTL", "site", sc.Name, "err", err)
+				} else {
+					log.Info("triggers installed", "site", sc.Name, "tables", n, "channel", sc.Channel)
+				}
+			}
 			dbs[i] = dbInfo{dbURL, ca}
 			feeds = append(feeds, &feed.Feed{URL: dbURL, CACert: ca, Channel: sc.Channel, Target: s, Log: log.With("site", sc.Name)})
 		}
@@ -303,6 +312,37 @@ func control(sites []*proxy.Site) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux
+}
+
+// installTriggers installs the feed's triggers on those of tables that exist (a table the
+// migrations have not created yet is skipped) and returns how many.
+func installTriggers(ctx context.Context, url, ca, channel string, tables []string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	pc, err := feed.ConnConfig(url, ca)
+	if err != nil {
+		return 0, err
+	}
+	conn, err := pgx.ConnectConfig(ctx, pc)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close(ctx)
+	var present []string
+	for _, t := range tables {
+		var ok bool
+		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", t).Scan(&ok); err != nil {
+			return 0, err
+		}
+		if ok {
+			present = append(present, t)
+		}
+	}
+	if len(present) == 0 {
+		return 0, nil
+	}
+	_, err = conn.Exec(ctx, feed.Triggers(channel, present))
+	return len(present), err
 }
 
 func triggers(cfg *config.Config, name string, apply bool) error {

@@ -12,9 +12,11 @@
 //!   billing  mvnw package + jlink → services/billing/{billing.jar, runtime/} (a trimmed JRE)
 //!   tcc      pnpm install, the C++ addon (optional), vite build of the dashboard, bun build --compile
 //!            → services/tcc/{tcc-v2.exe, web/, win_telemetry.node}
+//!   cache    go build (erp-v1/cache) → services/erp-cache.exe, cache.example.json → services/cache.json
 //!   launcher cargo build --release → sample-erp.exe, with the web app, SQL and migrations (ERP and TCC) inside
 //!
-//! Options: --no-billing (skip Maven and the JDK), --no-tcc (skip the TCC), --out DIR (default: erp-v1/bin)
+//! Options: --no-billing (skip Maven and the JDK), --no-tcc (skip the TCC), --no-cache (skip erp-cache),
+//! --out DIR (default: erp-v1/bin)
 
 use anyhow::{Context, Result, bail};
 use std::{
@@ -32,7 +34,7 @@ const WEB_API_URL: &str = "/api";
 const TCC_WORKSPACE: &str = "tcc-v2/tcc-v1/demo-monorepo-workspace";
 /// The ERP, from erp-v1
 const ERP: &str = "sample-ERP/sample-ERP";
-const USAGE: &str = "usage: cargo xtask dist [--no-billing] [--no-tcc] [--out DIR]";
+const USAGE: &str = "usage: cargo xtask dist [--no-billing] [--no-tcc] [--no-cache] [--out DIR]";
 /// What a Spring Boot 4 app with JPA, Flyway, Security and Actuator loads from the JDK.
 const BILLING_MODULES: &str = "java.base,java.compiler,java.desktop,java.instrument,java.management,\
 java.naming,java.net.http,java.prefs,java.rmi,java.scripting,java.security.jgss,java.security.sasl,\
@@ -53,19 +55,21 @@ fn main() -> Result<()> {
     let mut out = root.join("bin");
     let mut billing = true;
     let mut tcc = true;
+    let mut cache = true;
     let mut opts = opts.iter();
     while let Some(opt) = opts.next() {
         match opt.as_str() {
             "--no-billing" => billing = false,
             "--no-tcc" => tcc = false,
+            "--no-cache" => cache = false,
             "--out" => out = PathBuf::from(opts.next().context("--out needs a folder")?),
             other => bail!("unknown option {other}; {USAGE}"),
         }
     }
-    dist(&root, &out, billing, tcc)
+    dist(&root, &out, billing, tcc, cache)
 }
 
-fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
+fn dist(root: &Path, out: &Path, billing: bool, tcc: bool, cache: bool) -> Result<()> {
     let repo = &root.join(ERP);
     for tool in ["bun", "go"].into_iter().chain(billing.then_some("jlink")).chain(tcc.then_some("pnpm")) {
         if which(tool).is_none() {
@@ -131,6 +135,12 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
         build_tcc(&root.join(TCC_WORKSPACE), &services.join("tcc"))?;
     } else {
         step("tcc: skipped (--no-tcc)");
+    }
+
+    if cache {
+        build_cache(&root.join("cache"), &services)?;
+    } else {
+        step("cache: skipped (--no-cache)");
     }
 
     step("launcher: cargo build --release");
@@ -229,6 +239,19 @@ fn build_tcc(workspace: &Path, dest: &Path) -> Result<()> {
         copy(&addon, &dest.join("win_telemetry.node"))?;
     }
     Ok(())
+}
+
+/// erp-cache, the root's own Go module: the read cache in front of the API and the TCC server. Its
+/// cache.json is the example as is; the launcher hands it ports, upstreams and databases by env.
+fn build_cache(module: &Path, services: &Path) -> Result<()> {
+    step("cache: go build");
+    run(Command::new(tool("go"))
+        .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
+        .arg(services.join(format!("erp-cache{EXE}")))
+        .arg("./cmd/erp-cache")
+        .env("CGO_ENABLED", "0")
+        .current_dir(module))?;
+    copy(&module.join("cache.example.json"), &services.join("cache.json"))
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
