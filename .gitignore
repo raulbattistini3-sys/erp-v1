@@ -12,8 +12,7 @@
 /launcher/target/
 /bin/
 
-# local runtime state
-/cache/
+# local runtime state (cache/ is the erp-cache source and is tracked)
 /data/
 node_modules/
 target/

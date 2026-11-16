@@ -1,0 +1,61 @@
+{
+  "control": "127.0.0.1:7071",
+  "telemetry": {
+    "url": "http://127.0.0.1:8787/telemetry/host",
+    "tokenEnv": "TCC_TOKEN",
+    "source": "erp-cache",
+    "interval": "10s"
+  },
+  "sites": [
+    {
+      "name": "erp",
+      "listen": "127.0.0.1:10080",
+      "upstream": "http://127.0.0.1:10000",
+      "databaseUrlEnv": "ERP_CACHE_DATABASE_URL",
+      "channel": "erp_cache",
+      "maxEntries": 10000,
+      "maxBytes": 67108864,
+      "maxEntryBytes": 2097152,
+      "defaultTtl": "30s",
+      "vary": ["Authorization"],
+      "flushOn": ["usuarios"],
+      "warmup": ["/products/filter", "/products/snapshot", "/clientes/empresas", "/categorias"],
+      "warmupAuthEnv": "ERP_CACHE_WARMUP_AUTH",
+      "routes": [
+        { "path": "/products/filter", "tables": ["produtos", "categorias", "produto_marcacoes"] },
+        { "path": "/products/scroll", "tables": ["produtos", "categorias", "produto_marcacoes"] },
+        { "path": "/products/snapshot", "ttl": "60s", "tables": ["produtos", "categorias", "produto_marcacoes"] },
+        { "path": "/products/marcacoes", "ttl": "5m", "tables": ["produto_marcacoes"] },
+        { "path": "/categorias", "ttl": "5m", "tables": ["categorias"] },
+        { "path": "/clientes/empresas", "tables": ["empresas", "clientes", "empresa_contatos_erp", "cliente_senioridades"] },
+        { "path": "/clientes/empresas/setores", "ttl": "5m", "tables": ["empresas"] },
+        { "path": "/clientes/empresas/:id", "tables": ["empresas", "clientes", "empresa_contatos_erp", "cliente_senioridades"] },
+        { "path": "/clientes/funil", "tables": ["clientes", "empresas", "cliente_senioridades"] },
+        { "path": "/cobrancas/pagas", "tables": ["pagamentos_recorrentes", "pagamento_recorrente_ciclos", "clientes"] },
+        { "path": "/auditoria/pendentes", "ttl": "10s", "tables": ["auditorias", "detalhamentos_auditoria", "produtos_por_auditoria", "alteracoes_pendentes"] }
+      ]
+    },
+    {
+      "name": "tcc",
+      "listen": "127.0.0.1:8788",
+      "upstream": "http://127.0.0.1:8787",
+      "databaseUrlEnv": "TCC_CACHE_DATABASE_URL",
+      "databaseCaCertEnv": "DATABASE_CA_CERT",
+      "channel": "tcc_cache",
+      "defaultTtl": "15s",
+      "vary": ["Authorization"],
+      "warmup": ["/health", "/telemetry/host/boots", "/telemetry/host/latest"],
+      "routes": [
+        { "path": "/telemetry/host/boots", "tables": ["host_batches"] },
+        { "path": "/telemetry/host/latest", "ttl": "5s", "tables": ["host_samples", "host_batches"] },
+        { "path": "/telemetry/host/series", "tables": ["host_samples", "host_rollups"] },
+        { "path": "/telemetry/host/lifecycle", "tables": ["host_samples"] },
+        { "path": "/ingest/*", "tables": ["ingest_batches", "telemetry_events"] },
+        { "path": "/sweeps", "tables": ["sweep_runs"] },
+        { "path": "/sweeps/*", "tables": ["sweep_runs", "sweep_results"] },
+        { "path": "/scrapes", "tables": ["scrape_runs"] },
+        { "path": "/listings", "ttl": "60s", "tables": ["scraped_listings", "scrape_runs"] }
+      ]
+    }
+  ]
+}
