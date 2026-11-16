@@ -1,0 +1,55 @@
+{
+  "name": "polyvisor",
+  "version": "0.1.0",
+  "description": "Resource-aware supervisor for local applications that mix runtimes (Node, Bun, Java, Go, native): one process tree, Windows job objects and Linux cgroups v2, per-service and aggregate memory budgets, dependency-aware startup, memory-pressure admission, and a service-side adaptive runtime.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "polyvisor": "src/cli/index.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./runtime": "./src/runtime/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "native/",
+    "scripts/",
+    "examples/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ],
+  "scripts": {
+    "build": "npm run build:bin && npm run build:native",
+    "build:bin": "node scripts/build-bin.mjs",
+    "build:native": "node scripts/build-native.mjs",
+    "test": "node --test \"test/*.test.js\" && go test ./...",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "node-api-headers": "^1.5.0"
+  },
+  "keywords": [
+    "process-manager",
+    "supervisor",
+    "job-object",
+    "cgroups",
+    "memory-limit",
+    "admission-control",
+    "pm2"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/raulbattistini3-sys/erp-v1.git",
+    "directory": "supervisor"
+  }
+}
