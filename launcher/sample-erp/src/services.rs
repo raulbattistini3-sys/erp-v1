@@ -19,6 +19,10 @@ pub struct Spec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
+    /// Memory limit of the process in MB (0: none): on Windows a job object of its own with
+    /// JOB_OBJECT_LIMIT_PROCESS_MEMORY, nested in the launcher's kill-on-close job. An allocation over
+    /// it fails, the service dies and is restarted like any other crash.
+    pub memory_mb: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,13 +38,30 @@ const GRACE: Duration = Duration::from_secs(20);
 
 pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
     let mut backoff = Duration::from_secs(2);
+    #[allow(unused_mut, unused_variables)]
+    let mut limited = false;
+    #[allow(unused_mut, unused_variables)]
+    let mut starts = 0u32;
     loop {
         if *state.borrow() != State::Running {
             return;
         }
-        let mut child = match Command::new(&spec.program)
+        // the memory-limit job's name, handed to the service so its telemetry can read the job
+        #[cfg(windows)]
+        let job = (spec.memory_mb > 0).then(|| crate::windows::job_name(spec.name, starts));
+        #[cfg(not(windows))]
+        let job: Option<String> = None;
+        starts += 1;
+        let mut command = Command::new(&spec.program);
+        // limited: started suspended, resumed once it is in its job (see windows::CREATE_SUSPENDED)
+        #[cfg(windows)]
+        if spec.memory_mb > 0 {
+            command.creation_flags(crate::windows::CREATE_SUSPENDED);
+        }
+        let mut child = match command
             .args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .envs(job.iter().map(|n| ("WIN_TELEMETRY_JOB", n)))
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -56,6 +77,31 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
         };
         forward(spec.name, child.stdout.take());
         forward(spec.name, child.stderr.take());
+        // held until the child is gone: the job's name (WIN_TELEMETRY_JOB) lasts only while a handle does
+        #[cfg(windows)]
+        let _job = match child.id().filter(|_| spec.memory_mb > 0) {
+            None => None,
+            Some(pid) => match crate::windows::limit_memory(pid, spec.memory_mb, job.as_deref()) {
+                Err(e) => {
+                    crate::log(spec.name, &format!("memory limit of {} MB not applied: {e}", spec.memory_mb));
+                    None
+                }
+                Ok(handle) => {
+                    if !limited {
+                        crate::log(spec.name, &format!("memory limit {} MB (job object)", spec.memory_mb));
+                        limited = true;
+                    }
+                    Some(handle)
+                }
+            },
+        };
+        #[cfg(windows)]
+        if let Some(pid) = child.id().filter(|_| spec.memory_mb > 0) {
+            if let Err(e) = crate::windows::resume(pid) {
+                crate::log(spec.name, &format!("could not resume the process: {e}"));
+                let _ = child.kill().await;
+            }
+        }
         let started = Instant::now();
 
         tokio::select! {
@@ -91,7 +137,13 @@ fn forward(name: &'static str, stream: Option<impl AsyncRead + Unpin + Send + 's
         let mut lines = BufReader::new(stream).split(b'\n');
         while let Ok(Some(line)) = lines.next_segment().await {
             let line = String::from_utf8_lossy(&line);
-            crate::log(name, line.trim_end_matches('\r'));
+            let line = line.trim_end_matches('\r');
+            if name == "polyvisor" && line.contains(" | ") {
+                // already "service | line" from polyvisor
+                println!("{line}");
+            } else {
+                crate::log(name, line);
+            }
         }
     });
 }

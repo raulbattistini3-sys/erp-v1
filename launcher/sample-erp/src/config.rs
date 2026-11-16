@@ -3,7 +3,8 @@
 //! bin/
 //!   sample-erp.exe              this launcher, with the web app, SQL scripts and migrations embedded
 //!   services/                   network.exe, importer.exe, api.exe, billing/ (runtime/ + billing.jar),
-//!                               tcc/ (tcc-v2.exe, its dashboard in web/, win_telemetry.node)
+//!                               tcc/ (tcc-v2.exe, its dashboard in web/, win_telemetry.node),
+//!                               erp-cache.exe + cache.json (the read cache in front of the API and the TCC)
 //!   config/launcher.env         ports and options (optional, see launcher.env.example)
 //!   config/api.env              the API's optional secrets: Resend, Jira/HubSpot OAuth, ... (optional)
 //!   config/billing.env          Stripe keys; billing only starts when this file exists
@@ -82,9 +83,30 @@ impl Paths {
         self.services.join("tcc").join(format!("tcc-v2{EXE}"))
     }
 
+    /// erp-cache (erp-v1/cache, Go): the read cache in front of the API and the TCC server
+    pub fn cache(&self) -> PathBuf {
+        self.services.join("cache").join(format!("erp-cache{EXE}"))
+    }
+
+    /// Its sites, routes and tables (cache.example.json); ports and URLs come from the launcher
+    pub fn cache_config(&self) -> PathBuf {
+        self.services.join("cache").join("cache.json")
+    }
+
     /// The TCC dashboard (apps/web/dist, built with VITE_API_URL=""), served by tcc-v2.exe at /
     pub fn tcc_web(&self) -> PathBuf {
         self.services.join("tcc").join("web")
+    }
+
+    /// polyvisor (erp-v1/supervisor, Go): when present the launcher runs the stack under it
+    pub fn polyvisor(&self) -> PathBuf {
+        self.services.parent().unwrap_or(&self.services).join(format!("polyvisor{EXE}"))
+    }
+
+    /// polyvisor's service-side runtime (adaptive admission + polyvisor.node), given to services as
+    /// POLYVISOR_RUNTIME
+    pub fn polyvisor_runtime(&self) -> PathBuf {
+        self.services.parent().unwrap_or(&self.services).join("runtime")
     }
 }
 
@@ -115,6 +137,18 @@ pub struct Config {
     pub tcc_port: u16,
     /// ERP_TCC=off: don't start the TCC even when services/tcc is there.
     pub tcc: bool,
+    /// erp-cache's sites (in front of the API and the TCC) and its control port, loopback only.
+    pub cache_port: u16,
+    pub cache_tcc_port: u16,
+    pub cache_control_port: u16,
+    /// ERP_CACHE=off: don't start erp-cache even when services/cache/erp-cache.exe is there; /api then goes
+    /// straight to the API.
+    pub cache: bool,
+    /// ERP_POLYVISOR=off: supervise the services from the launcher even when polyvisor.exe is there.
+    pub polyvisor: bool,
+    /// Per-service memory limits in MB (ERP_<SERVICE>_MEMORY_MB; 0 = none), enforced by a job object
+    /// per service. The Bun executables ignore --max-old-space-size, so this is their only bound.
+    pub memory_mb: HashMap<&'static str, u64>,
     pub import_workers: String,
     pub open_browser: bool,
     pub gateway: GatewayConfig,
@@ -236,6 +270,20 @@ impl Config {
             // the same port as `pnpm dev` in the TCC workspace, so the extension's settings keep working
             tcc_port: port("ERP_TCC_PORT", 8787)?,
             tcc: flag(&vars, "ERP_TCC", true),
+            cache_port: port("ERP_CACHE_PORT", 10080)?,
+            cache_tcc_port: port("ERP_CACHE_TCC_PORT", 8788)?,
+            cache_control_port: port("ERP_CACHE_CONTROL_PORT", 7071)?,
+            cache: flag(&vars, "ERP_CACHE", true),
+            polyvisor: flag(&vars, "ERP_POLYVISOR", true),
+            // convo2.json: API heap 768 MB, TCC server 384 MB, billing -Xmx512m + metaspace + direct
+            // buffers; the limit is the whole process (heap plus native), so it sits above the heap
+            memory_mb: [("api", 1024.0), ("tcc", 512.0), ("billing", 1024.0), ("cache", 256.0), ("worker", 384.0), ("network", 0.0), ("importer", 0.0), ("vault", 0.0)]
+                .into_iter()
+                .map(|(name, default)| {
+                    let key = format!("ERP_{}_MEMORY_MB", name.to_uppercase());
+                    number(&vars, &key, default).map(|mb| (name, mb as u64))
+                })
+                .collect::<Result<_>>()?,
             import_workers: vars.get("ERP_IMPORT_WORKERS").cloned().unwrap_or_else(|| "2".into()),
             open_browser: flag(&vars, "ERP_OPEN_BROWSER", true),
             gateway: GatewayConfig {
@@ -343,6 +391,11 @@ impl Config {
 
     pub fn tcc_ca(&self) -> String {
         self.tcc_db.as_ref().and_then(|d| d.ca.as_ref()).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// The memory limit of a service in MB, 0 for none
+    pub fn memory_mb(&self, service: &str) -> u64 {
+        self.memory_mb.get(service).copied().unwrap_or(0)
     }
 
     pub fn tcc_url(&self) -> String {

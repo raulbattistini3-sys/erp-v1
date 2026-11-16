@@ -12,9 +12,13 @@
 //!   billing  mvnw package + jlink → services/billing/{billing.jar, runtime/} (a trimmed JRE)
 //!   tcc      pnpm install, the C++ addon (optional), vite build of the dashboard, bun build --compile
 //!            → services/tcc/{tcc-v2.exe, web/, win_telemetry.node}
+//!   cache    go build (erp-v1/cache) → services/cache/{erp-cache.exe, cache.json}
+//!   polyvisor go build (erp-v1/supervisor) → polyvisor.exe beside sample-erp.exe, the supervisor the launcher
+//!            hands the services to, + runtime/ (adaptive admission JS + polyvisor.node, C++, optional)
 //!   launcher cargo build --release → sample-erp.exe, with the web app, SQL and migrations (ERP and TCC) inside
 //!
-//! Options: --no-billing (skip Maven and the JDK), --no-tcc (skip the TCC), --out DIR (default: erp-v1/bin)
+//! Options: --no-billing (skip Maven and the JDK), --no-tcc (skip the TCC), --no-cache (skip erp-cache),
+//! --no-polyvisor (the launcher supervises the services itself), --out DIR (default: erp-v1/bin)
 
 use anyhow::{Context, Result, bail};
 use std::{
@@ -32,7 +36,7 @@ const WEB_API_URL: &str = "/api";
 const TCC_WORKSPACE: &str = "tcc-v2/tcc-v1/demo-monorepo-workspace";
 /// The ERP, from erp-v1
 const ERP: &str = "sample-ERP/sample-ERP";
-const USAGE: &str = "usage: cargo xtask dist [--no-billing] [--no-tcc] [--out DIR]";
+const USAGE: &str = "usage: cargo xtask dist [--no-billing] [--no-tcc] [--no-cache] [--no-polyvisor] [--out DIR]";
 /// What a Spring Boot 4 app with JPA, Flyway, Security and Actuator loads from the JDK.
 const BILLING_MODULES: &str = "java.base,java.compiler,java.desktop,java.instrument,java.management,\
 java.naming,java.net.http,java.prefs,java.rmi,java.scripting,java.security.jgss,java.security.sasl,\
@@ -48,25 +52,28 @@ fn main() -> Result<()> {
         bail!("unknown task {task}; {USAGE}");
     }
     // erp-v1: launcher/xtask/../..
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
-    let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
+    let root = real(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))?;
     let mut out = root.join("bin");
     let mut billing = true;
     let mut tcc = true;
+    let mut cache = true;
+    let mut polyvisor = true;
     let mut opts = opts.iter();
     while let Some(opt) = opts.next() {
         match opt.as_str() {
             "--no-billing" => billing = false,
             "--no-tcc" => tcc = false,
+            "--no-cache" => cache = false,
+            "--no-polyvisor" => polyvisor = false,
             "--out" => out = PathBuf::from(opts.next().context("--out needs a folder")?),
             other => bail!("unknown option {other}; {USAGE}"),
         }
     }
-    dist(&root, &out, billing, tcc)
+    dist(&root, &out, billing, tcc, cache, polyvisor)
 }
 
-fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
-    let repo = &root.join(ERP);
+fn dist(root: &Path, out: &Path, billing: bool, tcc: bool, cache: bool, polyvisor: bool) -> Result<()> {
+    let repo = &real(&root.join(ERP))?;
     for tool in ["bun", "go"].into_iter().chain(billing.then_some("jlink")).chain(tcc.then_some("pnpm")) {
         if which(tool).is_none() {
             bail!("{tool} is not on PATH (needed to build {}); see launcher/README.md", match tool {
@@ -93,7 +100,7 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
     let api = repo.join("api");
     run(Command::new(tool("bun")).args(["install", "--frozen-lockfile"]).current_dir(&api))?;
     run(Command::new(tool("bun"))
-        .args(["build", "--compile", "--minify-syntax", "src/index.ts", "--outfile"])
+        .args(["build", "--compile", "--minify-syntax", "src/entry.ts", "--outfile"])
         .arg(services.join(format!("api{EXE}")))
         .current_dir(&api))?;
 
@@ -128,9 +135,30 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
     }
 
     if tcc {
-        build_tcc(&root.join(TCC_WORKSPACE), &services.join("tcc"))?;
+        build_tcc(&real(&root.join(TCC_WORKSPACE))?, &services.join("tcc"))?;
     } else {
         step("tcc: skipped (--no-tcc)");
+    }
+
+    if cache {
+        build_cache(&root.join("cache"), &services.join("cache"))?;
+        // older dists left it loose in services/
+        let _ = fs::remove_file(services.join(format!("erp-cache{EXE}")));
+        let _ = fs::remove_file(services.join("cache.json"));
+    } else {
+        step("cache: skipped (--no-cache)");
+    }
+
+    if polyvisor {
+        // the entry the launcher hands the stack to: polyvisor.exe beside sample-erp.exe, its runtime in runtime/
+        build_polyvisor(&root.join("supervisor"), out)?;
+        let _ = fs::remove_dir_all(services.join("polyvisor"));
+    } else {
+        step("polyvisor: skipped (--no-polyvisor)");
+        // a stale one would still be picked up by the launcher
+        let _ = fs::remove_dir_all(services.join("polyvisor"));
+        let _ = fs::remove_file(out.join(format!("polyvisor{EXE}")));
+        let _ = fs::remove_dir_all(out.join("runtime"));
     }
 
     step("launcher: cargo build --release");
@@ -138,8 +166,10 @@ fn dist(root: &Path, out: &Path, billing: bool, tcc: bool) -> Result<()> {
     run(Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(["build", "--release", "-p", "sample-erp"])
         .current_dir(&launcher))?;
+    // cargo's own target folder, wherever CARGO_TARGET_DIR puts it
+    let target = env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| launcher.join("target"));
     copy(
-        &launcher.join("target/release").join(format!("sample-erp{EXE}")),
+        &target.join("release").join(format!("sample-erp{EXE}")),
         &out.join(format!("sample-erp{EXE}")),
     )?;
 
@@ -231,6 +261,45 @@ fn build_tcc(workspace: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// erp-cache, the root's own Go module: the read cache in front of the API and the TCC server. Its
+/// cache.json is the example as is; the launcher hands it ports, upstreams and databases by env.
+fn build_cache(module: &Path, dest: &Path) -> Result<()> {
+    step("cache: go build");
+    fs::create_dir_all(dest)?;
+    run(Command::new(tool("go"))
+        .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
+        .arg(dest.join(format!("erp-cache{EXE}")))
+        .arg("./cmd/erp-cache")
+        .env("CGO_ENABLED", "0")
+        .current_dir(module))?;
+    copy(&module.join("cache.example.json"), &dest.join("cache.json"))
+}
+
+/// polyvisor, the root's supervisor (Go) and its service-side runtime. The addon (polyvisor.node, Windows)
+/// needs node-api-headers and a C++ compiler; without it the runtime reads the job through env limits only.
+fn build_polyvisor(module: &Path, dest: &Path) -> Result<()> {
+    step("polyvisor: go build");
+    run(Command::new(tool("go"))
+        .args(["build", "-trimpath", "-ldflags=-s -w", "-o"])
+        .arg(dest.join(format!("polyvisor{EXE}")))
+        .arg("./cmd/polyvisor")
+        .env("CGO_ENABLED", "0")
+        .current_dir(module))?;
+    let runtime = module.join("src").join("runtime");
+    if cfg!(windows) {
+        step("polyvisor: C++ addon (polyvisor.node)");
+        let built = which("node").is_some()
+            && (module.join("node_modules").join("node-api-headers").exists()
+                || run(Command::new(tool("npm")).args(["install", "--no-audit", "--no-fund"]).current_dir(module)).is_ok())
+            && run(Command::new(tool("node")).arg("scripts/build-native.mjs").current_dir(module)).is_ok();
+        if !built {
+            println!("  polyvisor.node not built (node, npm and a C++ compiler are needed); the runtime falls back to env limits");
+        }
+    }
+    let _ = fs::remove_dir_all(dest.join("runtime"));
+    copy_dir(&runtime, &dest.join("runtime"))
+}
+
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
@@ -243,6 +312,13 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The real path, without the \\?\ prefix. A submodule folder may be a junction (to a worktree of the
+/// submodule), and vite refuses to emit index.html when its root and the build's cwd disagree on the path.
+fn real(path: &Path) -> Result<PathBuf> {
+    let real = path.canonicalize().with_context(|| format!("{} is missing", path.display()))?;
+    Ok(PathBuf::from(real.to_string_lossy().trim_start_matches(r"\\?\")))
 }
 
 fn step(message: &str) {

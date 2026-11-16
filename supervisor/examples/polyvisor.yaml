@@ -1,0 +1,55 @@
+# A local application mixing runtimes. Memory limits cover each service's whole process tree (the job
+# object / cgroup), not just the V8 or JVM heap: leave headroom above -Xmx / --max-old-space-size.
+application:
+  name: sample-erp
+
+  resources:
+    memoryBudget: 2048MB       # the application's job object / cgroup (all services together)
+    reserveForSystem: 1024MB   # optional services wait while the machine has less free than this
+
+  services:
+    api:
+      command: node
+      args: ["--max-old-space-size=384", "dist/api/index.js"]
+      required: true
+      memory:
+        softLimit: 384MB       # pressure event + the runtime starts shedding background work
+        hardLimit: 512MB       # the job object refuses allocations past this
+      ready:
+        tcp: "3000"
+      stop:
+        signal: break          # own console group, CTRL_BREAK (SIGBREAK in Node)
+        grace: 15s
+
+    worker:
+      command: node
+      args: ["dist/worker/index.js"]
+      dependsOn: [api]
+      required: false
+      memory:
+        softLimit: 256MB
+        hardLimit: 384MB
+      scheduling:
+        priority: background
+        maxConcurrency: 2      # POLYVISOR_MAX_CONCURRENCY for the runtime's background class
+
+    billing:
+      command: java
+      args: ["-Xms128m", "-Xmx512m", "-XX:MaxMetaspaceSize=192m", "-jar", "billing.jar"]
+      required: true
+      memory:
+        softLimit: 640MB
+        hardLimit: 768MB
+      ready:
+        http: "http://127.0.0.1:8080/actuator/health"
+        timeout: 180s
+      restart:
+        policy: on-failure
+        maxRestarts: 5
+        window: 10m
+
+    importer:
+      command: ./importer.exe
+      required: false
+      scheduling:
+        priority: background

@@ -10,6 +10,7 @@
 mod certs;
 mod config;
 mod db;
+mod polyvisor;
 mod services;
 mod web;
 #[cfg(windows)]
@@ -139,6 +140,7 @@ async fn run_stack(
 
     let (state_tx, state_rx) = watch::channel(State::Running);
     let mut tasks = JoinSet::new();
+    let mut specs: Vec<Spec> = Vec::new();
     let secrets = &cfg.secrets;
     let cwd = paths.data.clone();
     let owned = |pairs: &[(&str, String)]| -> Vec<(String, String)> {
@@ -170,6 +172,12 @@ async fn run_stack(
         // the API and billing announce https:// addresses signed by the internal CA
         ("NETWORK_UPSTREAM_CA", path(&tls.ca)),
     ]);
+    // erp-cache, when shipped: /api goes to the cache's "api-cache" registration, which answers the
+    // cached reads (products, clientes) and forwards everything else to the API
+    let cache = cfg.cache && paths.cache().exists() && paths.cache_config().exists();
+    if cache {
+        network_env.push(("NETWORK_ROUTES".into(), "/api=api-cache,/billing=billing,/=web".into()));
+    }
     if let Some((cert, key)) = &g.tls {
         network_env.extend(owned(&[
             ("NETWORK_TLS_CERT", cert.to_string_lossy().into_owned()),
@@ -182,10 +190,7 @@ async fn run_stack(
             network_env.push((k, v));
         }
     }
-    tasks.spawn(services::supervise(
-        Spec { name: "network", program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    specs.push(Spec { name: "network", memory_mb: cfg.memory_mb("network"), program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() });
     let joins = |name: &str| -> Vec<(String, String)> {
         owned(&[
             ("NETWORK_URL", network_url.clone()),
@@ -202,9 +207,8 @@ async fn run_stack(
     if tcc {
         let dir = paths.data.join("tcc");
         std::fs::create_dir_all(&dir)?;
-        tasks.spawn(services::supervise(
-            Spec {
-                name: "tcc",
+        specs.push(Spec {
+                name: "tcc", memory_mb: cfg.memory_mb("tcc"),
                 program: paths.tcc(),
                 args: vec![],
                 env: [joins("tcc"), owned(&[
@@ -223,18 +227,15 @@ async fn run_stack(
                     ("SPOOL_DIR", path(&dir.join("spool"))),
                     ("TELEMETRY_LOG_DIR", path(&dir.join("logs"))),
                     ("INSTANCE_ID", "tcc-launcher".into()),
-                ])]
+                ]), bun_heap(cfg.memory_mb("tcc"))]
                 .concat(),
                 cwd: dir,
-            },
-            state_rx.clone(),
-        ));
+            });
     }
 
     // importer: reads, validates and saves product spreadsheets queued in the importacoes table
-    tasks.spawn(services::supervise(
-        Spec {
-            name: "importer",
+    specs.push(Spec {
+            name: "importer", memory_mb: cfg.memory_mb("importer"),
             program: paths.importer(),
             args: vec![],
             env: owned(&[
@@ -255,9 +256,7 @@ async fn run_stack(
             .chain(joins("importer"))
             .collect(),
             cwd: cwd.clone(),
-        },
-        state_rx.clone(),
-    ));
+        });
 
     // vault: the usuarios' CPF and birth dates, AES-256-GCM under keys in data/vault-keys. On Windows the
     // keys are DPAPI blobs bound to this Windows account: the folder copied to another machine or user
@@ -268,9 +267,8 @@ async fn run_stack(
         use sha2::{Digest, Sha256};
         Sha256::digest(secrets.vault_token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    tasks.spawn(services::supervise(
-        Spec {
-            name: "vault",
+    specs.push(Spec {
+            name: "vault", memory_mb: cfg.memory_mb("vault"),
             program: paths.vault(),
             args: vec!["serve".into()],
             env: owned(&[
@@ -289,9 +287,7 @@ async fn run_stack(
                 ("VAULT_ENV", "development".into()),
             ]),
             cwd: cwd.clone(),
-        },
-        state_rx.clone(),
-    ));
+        });
 
     // api: defaults, then config/api.env, then what the launcher owns (as in docker-compose.yml, the
     // database, host/port, URLs and CORS always win over the file)
@@ -341,17 +337,65 @@ async fn run_stack(
     // the web's search timings (products, Empresas), the API's own events and its host metrics go to the
     // TCC server (api/src/utils/telemetry); without the TCC the API sends nothing
     if tcc {
+        // through erp-cache's tcc site when it runs: an envelope the TCC already took is answered there
+        // (X-Cache: dedupe) instead of costing the TCC a POST and an ON CONFLICT lookup
+        let telemetry = if cache { format!("http://127.0.0.1:{}", cfg.cache_tcc_port) } else { cfg.tcc_url() };
         api_env.extend(owned(&[
-            ("TCC_TELEMETRY_URL", format!("{}/telemetry/host", cfg.tcc_url())),
+            ("TCC_TELEMETRY_URL", format!("{telemetry}/telemetry/host")),
             ("TCC_TOKEN", secrets.tcc_token.clone()),
             ("TELEMETRY_INSTANCE_ID", "api-launcher".into()),
+            // the host telemetry goes over Node IPC instead of HTTP: the API forks tcc-v2.exe in its ingest
+            // mode, which inherits the API's job object (read with win_telemetry.node beside it) and stores
+            // the envelopes it is sent straight into the TCC database; HTTP above is the fallback
+            ("TCC_INGEST_EXE", path(&paths.tcc())),
+            ("TCC_INGEST_DATABASE_URL", cfg.tcc_database_url()),
+            ("TCC_INGEST_DATABASE_SSL", if cfg.tcc_db.is_some() { "verify" } else { "off" }.into()),
+            ("TCC_INGEST_DATABASE_CA_CERT", cfg.tcc_ca()),
         ]));
     }
+    // the background worker: the same api.exe with API_ROLE=worker runs the pg-boss consumers in its own
+    // process (and job object), so their allocations never reach the API's heap; the API only produces
+    let mut worker_env = api_env.clone();
+    worker_env.push(("API_ROLE".into(), "worker".into()));
+    worker_env.push(("TELEMETRY_INSTANCE_ID".into(), "worker-launcher".into()));
+    worker_env.extend(bun_heap(cfg.memory_mb("worker")));
+    api_env.push(("API_ROLE".into(), "api".into()));
     api_env.extend(joins("api"));
-    tasks.spawn(services::supervise(
-        Spec { name: "api", program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    api_env.extend(bun_heap(cfg.memory_mb("api")));
+    specs.push(Spec { name: "api", memory_mb: cfg.memory_mb("api"), program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() });
+    specs.push(Spec { name: "worker", memory_mb: cfg.memory_mb("worker"), program: paths.api(), args: vec![], env: worker_env, cwd: cwd.clone() });
+
+    // erp-cache: the read cache (erp-v1/cache) in front of the API (site "erp", registered as api-cache,
+    // which the gateway's /api goes to) and the TCC server (site "tcc", which also answers resent
+    // telemetry envelopes). Its feed listens to the databases' triggers, installed at its start.
+    if cache {
+        let mut env = joins("cache");
+        env.extend(owned(&[
+            ("CACHE_CONFIG", path(&paths.cache_config())),
+            ("CACHE_CONTROL_ADDR", format!("127.0.0.1:{}", cfg.cache_control_port)),
+            ("CACHE_INSTALL_TRIGGERS", "1".into()),
+            ("CACHE_ERP_LISTEN", format!("127.0.0.1:{}", cfg.cache_port)),
+            ("CACHE_ERP_UPSTREAM", format!("https://127.0.0.1:{}", cfg.api_port)),
+            ("CACHE_ERP_UPSTREAM_CA", path(&tls.ca)),
+            ("CACHE_ERP_REGISTER", "api-cache".into()),
+            ("ERP_CACHE_DATABASE_URL", cfg.database_url()),
+            ("ERP_CACHE_DATABASE_CA_CERT", cfg.database_ca()),
+            ("CACHE_TCC_LISTEN", format!("127.0.0.1:{}", cfg.cache_tcc_port)),
+            ("CACHE_TCC_UPSTREAM", cfg.tcc_url()),
+            ("CACHE_TCC_REGISTER", "off".into()),
+            ("TCC_CACHE_DATABASE_URL", if tcc { cfg.tcc_database_url() } else { String::new() }),
+            ("DATABASE_CA_CERT", cfg.tcc_ca()),
+            ("TCC_TELEMETRY_URL", if tcc { format!("{}/telemetry/host", cfg.tcc_url()) } else { String::new() }),
+            ("TCC_TOKEN", secrets.tcc_token.clone()),
+        ]));
+        specs.push(Spec {
+                name: "cache", memory_mb: cfg.memory_mb("cache"),
+                program: paths.cache(),
+                args: vec![],
+                env,
+                cwd: cwd.clone(),
+            });
+    }
 
     // billing: Stripe webhooks; its Flyway migrations run in the billing schema of the same database
     if billing {
@@ -371,16 +415,30 @@ async fn run_stack(
             ("SERVER_FORWARD_HEADERS_STRATEGY", "framework".into()),
         ]));
         env.extend(joins("billing"));
-        tasks.spawn(services::supervise(
-            Spec {
-                name: "billing",
+        specs.push(Spec {
+                name: "billing", memory_mb: cfg.memory_mb("billing"),
                 program: paths.billing_java(),
-                args: vec!["-jar".into(), paths.billing_jar().to_string_lossy().into_owned()],
+                // JVM limits before -jar (heap, metaspace, direct buffers); the job object is the final bound
+                args: ["-Xms128m", "-Xmx512m", "-XX:MaxMetaspaceSize=192m", "-XX:MaxDirectMemorySize=128m", "-jar"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain([paths.billing_jar().to_string_lossy().into_owned()])
+                    .collect(),
                 env,
                 cwd: cwd.clone(),
-            },
-            state_rx.clone(),
-        ));
+            });
+    }
+
+    // polyvisor, when shipped, is the one process the launcher starts: it runs the services above in their
+    // job objects (see polyvisor.rs); otherwise each Spec is supervised here, in its own job
+    if cfg.polyvisor && paths.polyvisor().exists() {
+        let file = polyvisor::write_config(paths, cfg, &specs)?;
+        log("launcher", &format!("handing {} services to polyvisor ({})", specs.len(), file.display()));
+        tasks.spawn(services::supervise(polyvisor::spec(paths, file), state_rx.clone()));
+    } else {
+        for spec in specs {
+            tasks.spawn(services::supervise(spec, state_rx.clone()));
+        }
     }
 
     let banner = {
@@ -435,6 +493,15 @@ async fn run_stack(
     let _ = state_tx.send(outcome);
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Bun's heap budget for a memory limit of `mb` (0: none): BUN_JSC_forceRAMSize makes JavaScriptCore
+/// size its GC as if the machine had that much RAM, the closest Bun has to --max-old-space-size.
+fn bun_heap(mb: u64) -> Vec<(String, String)> {
+    if mb == 0 {
+        return vec![];
+    }
+    vec![("BUN_JSC_forceRAMSize".into(), (mb * 3 / 4 * 1024 * 1024).to_string())]
 }
 
 async fn wait_for_port(port: u16, limit: Duration) -> bool {
