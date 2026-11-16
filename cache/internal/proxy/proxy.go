@@ -7,6 +7,9 @@
 //     can't prove an entry is current, so every request goes to the upstream ("x-cache: bypass");
 //   - an entry for the same path, query and Vary headers (Authorization for the ERP: per user) is live.
 //
+// A POST on a configured dedupe path (telemetry envelopes) that resends a record the upstream already
+// accepted is answered here ("x-cache: dedupe"), see dedupe.go.
+//
 // A miss goes to the upstream once per key, however many identical requests arrive meanwhile
 // (singleflight). The response is stored if it is a 200 without Set-Cookie or "no-store", fits the
 // size limits and none of its tables changed while it was fetched.
@@ -16,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -24,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -74,6 +80,7 @@ type Site struct {
 	Name    string
 	Store   *store.Store
 	routes  []route
+	dedupes []*dedupe
 	vary    []string
 	flushOn []string
 	up      *url.URL
@@ -95,8 +102,21 @@ func New(cfg config.Site, hasFeed bool, log *slog.Logger) (*Site, error) {
 	if err != nil {
 		return nil, err
 	}
+	var tlsConfig *tls.Config
+	if cfg.UpstreamCA != "" {
+		pem, err := os.ReadFile(cfg.UpstreamCA)
+		if err != nil {
+			return nil, fmt.Errorf("site %s: upstream CA: %w", cfg.Name, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("site %s: no PEM certificate in %s", cfg.Name, cfg.UpstreamCA)
+		}
+		tlsConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
 	transport := &http.Transport{
 		Proxy:               nil,
+		TLSClientConfig:     tlsConfig,
 		DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 64,
@@ -125,6 +145,9 @@ func New(cfg config.Site, hasFeed bool, log *slog.Logger) (*Site, error) {
 			rt.segs = strings.Split(p, "/")
 		}
 		s.routes = append(s.routes, rt)
+	}
+	for _, d := range cfg.Dedupe {
+		s.dedupes = append(s.dedupes, newDedupe(d))
 	}
 	// everything that isn't cached, websockets and streams included, goes through as it came
 	s.bypass = &httputil.ReverseProxy{
@@ -176,6 +199,10 @@ func (s *Site) Bypassed() uint64 { return s.bypassed.Load() }
 func (s *Site) UpstreamLatency() LatencySummary { return s.upstream.take() }
 
 func (s *Site) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if d := s.dedupeFor(r); d != nil {
+		s.serveDedupe(w, r, d)
+		return
+	}
 	rt := s.routeFor(r)
 	if rt == nil || !s.feedUp.Load() || strings.Contains(strings.ToLower(r.Header.Get("Cache-Control")), "no-cache") {
 		s.bypassed.Add(1)

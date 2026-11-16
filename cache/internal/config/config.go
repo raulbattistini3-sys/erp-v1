@@ -54,6 +54,13 @@ type Site struct {
 	Name     string `json:"name"`
 	Listen   string `json:"listen"`
 	Upstream string `json:"upstream"`
+	// UpstreamCA is a PEM file the upstream's certificate is checked against, for an https:// upstream
+	// signed by a private CA (the launcher's API: the internal CA in data/certs).
+	UpstreamCA string `json:"upstreamCa"`
+	// Register is the service name this site joins the network registry as, when NETWORK_URL and
+	// NETWORK_TOKEN are set (the launcher, `network dev`); the gateway then routes a prefix to it with
+	// NETWORK_ROUTES="/api=api-cache,...". Empty: not registered, clients use Listen directly.
+	Register string `json:"register"`
 	// DatabaseURLEnv names the variable with a postgres:// URL to LISTEN on. It must be a session
 	// connection: Supabase's transaction pooler (6543) does not deliver notifications; use 5432.
 	// Empty: no feed, entries only expire by TTL (fine for a demo, not for data that must be current).
@@ -71,6 +78,8 @@ type Site struct {
 	// FlushOn are tables whose change drops everything (users, permissions: who may see what).
 	FlushOn []string `json:"flushOn"`
 	Routes  []Route  `json:"routes"`
+	// Dedupe are POST paths whose resends the cache answers itself (see Dedupe).
+	Dedupe []Dedupe `json:"dedupe"`
 	// Warmup are GET paths requested twice straight at the upstream once it answers, at startup: the
 	// first answer pays the upstream's cold start (compilation, JIT, lazy pools), the second does not.
 	// The difference is reported (type "cold-start"); nothing is cached.
@@ -90,6 +99,19 @@ type Route struct {
 	Tables []string `json:"tables"` // what the response is read from; a change in any of them drops it
 }
 
+// Dedupe is a POST path that writes records identified by fields of its JSON body (telemetry
+// envelopes: source, instanceId, bootId, sequence). Once the upstream accepted a record (2xx), a
+// resend of it, from a sender that retried after a timeout or after a restart, is answered by the
+// cache with that same status and never reaches the upstream: no request, no INSERT ... ON CONFLICT.
+// A record the upstream accepts drops the cached GETs that read Invalidates, so a dashboard reading
+// through the cache sees it without waiting for the TTL or for the database feed.
+type Dedupe struct {
+	Path        string   `json:"path"`
+	Keys        []string `json:"keys"`        // top-level body fields, all required, that identify a record
+	Invalidates []string `json:"invalidates"` // tables the record is written to
+	MaxKeys     int      `json:"maxKeys"`     // records remembered, the oldest forgotten first; default 100000
+}
+
 var defaults = Config{
 	Control:   "127.0.0.1:7071",
 	Telemetry: Telemetry{Source: "erp-cache", Interval: Duration(10 * time.Second)},
@@ -98,7 +120,8 @@ var defaults = Config{
 // Load reads path (if it exists or was asked for explicitly) over the defaults, then the environment:
 //
 //	CACHE_CONTROL_ADDR, TCC_TELEMETRY_URL,
-//	CACHE_<SITE>_LISTEN, CACHE_<SITE>_UPSTREAM  (<SITE> = the name upper-cased, "-" → "_")
+//	CACHE_<SITE>_LISTEN, CACHE_<SITE>_UPSTREAM, CACHE_<SITE>_UPSTREAM_CA, CACHE_<SITE>_REGISTER
+//	(<SITE> = the name upper-cased, "-" → "_"; CACHE_<SITE>_REGISTER=off leaves the registry alone)
 func Load(path string, explicit bool) (*Config, error) {
 	c := defaults
 	b, err := os.ReadFile(path)
@@ -127,6 +150,14 @@ func Load(path string, explicit bool) (*Config, error) {
 		if v := os.Getenv(p + "UPSTREAM"); v != "" {
 			s.Upstream = v
 		}
+		if v := os.Getenv(p + "UPSTREAM_CA"); v != "" {
+			s.UpstreamCA = v
+		}
+		if v := os.Getenv(p + "REGISTER"); v == "off" {
+			s.Register = ""
+		} else if v != "" {
+			s.Register = v
+		}
 		fill(s)
 	}
 	return &c, c.validate()
@@ -154,6 +185,11 @@ func fill(s *Site) {
 	for i := range s.Routes {
 		if s.Routes[i].TTL == 0 {
 			s.Routes[i].TTL = s.DefaultTTL
+		}
+	}
+	for i := range s.Dedupe {
+		if s.Dedupe[i].MaxKeys == 0 {
+			s.Dedupe[i].MaxKeys = 100_000
 		}
 	}
 }
@@ -204,6 +240,16 @@ func (c *Config) validate() error {
 			for _, t := range r.Tables {
 				if !ident.MatchString(t) {
 					return fmt.Errorf("site %s: route %s: table %q is not a plain table name", s.Name, r.Path, t)
+				}
+			}
+		}
+		for _, d := range s.Dedupe {
+			if !strings.HasPrefix(d.Path, "/") || len(d.Keys) == 0 {
+				return fmt.Errorf("site %s: dedupe %q needs a path starting with / and at least one key", s.Name, d.Path)
+			}
+			for _, t := range d.Invalidates {
+				if !ident.MatchString(t) {
+					return fmt.Errorf("site %s: dedupe %s: table %q is not a plain table name", s.Name, d.Path, t)
 				}
 			}
 		}

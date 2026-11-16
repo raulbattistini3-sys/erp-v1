@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,7 @@ import (
 	"github.com/raulbattistini3-sys/erp-cache/internal/coldstart"
 	"github.com/raulbattistini3-sys/erp-cache/internal/config"
 	"github.com/raulbattistini3-sys/erp-cache/internal/feed"
+	"github.com/raulbattistini3-sys/erp-cache/internal/network"
 	"github.com/raulbattistini3-sys/erp-cache/internal/proxy"
 	"github.com/raulbattistini3-sys/erp-cache/internal/report"
 )
@@ -134,6 +136,17 @@ func serve(cfg *config.Config, log *slog.Logger) error {
 		go func() { errc <- listen(srv) }()
 		log.Info("site listening", "site", s.Name, "addr", srv.Addr, "upstream", cfg.Sites[i].Upstream)
 	}
+	// sites with "register" join the network registry, so the gateway can route a prefix through them
+	if nc, ok := network.FromEnv(); ok {
+		for _, sc := range cfg.Sites {
+			if sc.Register == "" {
+				continue
+			}
+			reg := network.Registration{Address: "http://" + advertise(sc.Listen), Meta: map[string]string{"cache": sc.Name, "upstream": sc.Upstream}}
+			id := network.InstanceID(sc.Register)
+			wg.Go(func() { nc.Keep(ctx, sc.Register, id, reg, 5*time.Second, log.With("site", sc.Name)) })
+		}
+	}
 	ctl := &http.Server{Addr: cfg.Control, Handler: control(sites), ReadHeaderTimeout: 10 * time.Second}
 	servers = append(servers, ctl)
 	go func() { errc <- listen(ctl) }()
@@ -226,6 +239,21 @@ func slowestTable(ts []coldstart.Table) *coldstart.Table {
 	return s
 }
 
+// advertise is the address others reach a listen address at: NETWORK_ADVERTISE_HOST, or loopback for
+// a wildcard host.
+func advertise(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	if h := strings.TrimSpace(os.Getenv("NETWORK_ADVERTISE_HOST")); h != "" {
+		host = h
+	} else if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func listen(srv *http.Server) error {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("%s: %w", srv.Addr, err)
@@ -253,7 +281,7 @@ func control(sites []*proxy.Site) http.Handler {
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		out := map[string]any{}
 		for _, s := range sites {
-			out[s.Name] = map[string]any{"feedUp": s.FeedUp(), "bypassed": s.Bypassed(), "store": s.Store.Stats()}
+			out[s.Name] = map[string]any{"feedUp": s.FeedUp(), "bypassed": s.Bypassed(), "store": s.Store.Stats(), "dedupe": s.Dedupes()}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)
@@ -264,6 +292,7 @@ func control(sites []*proxy.Site) http.Handler {
 		for _, s := range sites {
 			if name == "" || s.Name == name {
 				s.Store.ForgetAll()
+				s.ForgetRecords()
 				n++
 			}
 		}

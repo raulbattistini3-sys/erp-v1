@@ -45,6 +45,13 @@
       "defaultTtl": "15s",
       "vary": ["Authorization"],
       "warmup": ["/health", "/telemetry/host/boots", "/telemetry/host/latest"],
+      "dedupe": [
+        {
+          "path": "/telemetry/host",
+          "keys": ["source", "instanceId", "bootId", "sequence"],
+          "invalidates": ["host_batches", "host_samples"]
+        }
+      ],
       "routes": [
         { "path": "/telemetry/host/boots", "tables": ["host_batches"] },
         { "path": "/telemetry/host/latest", "ttl": "5s", "tables": ["host_samples", "host_batches"] },
