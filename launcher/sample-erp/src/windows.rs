@@ -83,6 +83,31 @@ pub fn limit_memory(pid: u32, mb: u64, name: Option<&str>) -> io::Result<Job> {
     }
 }
 
+/// Process creation flag: the child's first thread waits for [`resume`], so it is in its memory-limit
+/// job before it runs a single instruction, and so is every process it starts (the API spawns its
+/// telemetry ingest child within milliseconds; spawned before the job, that child would sit outside it
+/// and see no limit).
+pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtResumeProcess(process: HANDLE) -> i32;
+}
+
+/// Resumes a child started with [`CREATE_SUSPENDED`] (all of its threads; there is only the first).
+pub fn resume(pid: u32) -> io::Result<()> {
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    unsafe {
+        let process = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let status = NtResumeProcess(process);
+        CloseHandle(process);
+        if status < 0 { Err(io::Error::other(format!("NtResumeProcess: NTSTATUS {status:#x}"))) } else { Ok(()) }
+    }
+}
+
 /// A job object handle, closed on drop. Dropping it doesn't end the job (its processes keep it), but
 /// it does take a named job out of the namespace.
 pub struct Job(HANDLE);
@@ -160,7 +185,9 @@ mod tests {
             return;
         }
         let name = std::env::var("WIN_TELEMETRY_JOB").ok();
-        for _ in 0..100 {
+        // LIMIT_PROBE_ONCE: one look, at start — the limit must already be there
+        let tries = if std::env::var_os("LIMIT_PROBE_ONCE").is_some() { 1 } else { 100 };
+        for _ in 0..tries {
             if let Some(limit) = limit_of(name.as_deref()) {
                 println!("LIMIT={limit}");
                 return;
@@ -200,5 +227,25 @@ mod tests {
         assert!(out.contains(&format!("LIMIT={}", 200usize << 20)), "child said: {out}");
         // gone with its handle and process
         assert_eq!(limit_of(Some(&name)), None);
+    }
+
+    /// Started suspended, limited, then resumed (what supervise does): the child is in its job from its
+    /// first instruction, so whatever it forks at start (the API's tcc-v2.exe ingest child) is too.
+    #[test]
+    fn a_suspended_child_is_limited_before_it_runs() {
+        use std::os::windows::process::CommandExt;
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "windows::tests::probe", "--nocapture", "--test-threads=1"])
+            .env("LIMIT_PROBE", "1")
+            .env("LIMIT_PROBE_ONCE", "1")
+            .env_remove("WIN_TELEMETRY_JOB")
+            .stdout(std::process::Stdio::piped())
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        let _job = limit_memory(child.id(), 250, None).unwrap();
+        resume(child.id()).unwrap();
+        let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+        assert!(out.contains(&format!("LIMIT={}", 250usize << 20)), "child said: {out}");
     }
 }

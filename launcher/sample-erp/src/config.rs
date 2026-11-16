@@ -97,6 +97,17 @@ impl Paths {
     pub fn tcc_web(&self) -> PathBuf {
         self.services.join("tcc").join("web")
     }
+
+    /// polyvisor (erp-v1/supervisor, Go): when present the launcher runs the stack under it
+    pub fn polyvisor(&self) -> PathBuf {
+        self.services.join("polyvisor").join(format!("polyvisor{EXE}"))
+    }
+
+    /// polyvisor's service-side runtime (adaptive admission + polyvisor.node), given to services as
+    /// POLYVISOR_RUNTIME
+    pub fn polyvisor_runtime(&self) -> PathBuf {
+        self.services.join("polyvisor").join("runtime")
+    }
 }
 
 /// Secrets generated on first launch and kept in data/secrets.env. The Postgres password is fixed
@@ -133,6 +144,8 @@ pub struct Config {
     /// ERP_CACHE=off: don't start erp-cache even when services/erp-cache.exe is there; /api then goes
     /// straight to the API.
     pub cache: bool,
+    /// ERP_POLYVISOR=off: supervise the services from the launcher even when services/polyvisor is there.
+    pub polyvisor: bool,
     /// Per-service memory limits in MB (ERP_<SERVICE>_MEMORY_MB; 0 = none), enforced by a job object
     /// per service. The Bun executables ignore --max-old-space-size, so this is their only bound.
     pub memory_mb: HashMap<&'static str, u64>,
@@ -261,6 +274,7 @@ impl Config {
             cache_tcc_port: port("ERP_CACHE_TCC_PORT", 8788)?,
             cache_control_port: port("ERP_CACHE_CONTROL_PORT", 7071)?,
             cache: flag(&vars, "ERP_CACHE", true),
+            polyvisor: flag(&vars, "ERP_POLYVISOR", true),
             // convo2.json: API heap 768 MB, TCC server 384 MB, billing -Xmx512m + metaspace + direct
             // buffers; the limit is the whole process (heap plus native), so it sits above the heap
             memory_mb: [("api", 1024.0), ("tcc", 512.0), ("billing", 1024.0), ("cache", 256.0), ("network", 0.0), ("importer", 0.0), ("vault", 0.0)]

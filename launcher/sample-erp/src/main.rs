@@ -10,6 +10,7 @@
 mod certs;
 mod config;
 mod db;
+mod polyvisor;
 mod services;
 mod web;
 #[cfg(windows)]
@@ -139,6 +140,7 @@ async fn run_stack(
 
     let (state_tx, state_rx) = watch::channel(State::Running);
     let mut tasks = JoinSet::new();
+    let mut specs: Vec<Spec> = Vec::new();
     let secrets = &cfg.secrets;
     let cwd = paths.data.clone();
     let owned = |pairs: &[(&str, String)]| -> Vec<(String, String)> {
@@ -188,10 +190,7 @@ async fn run_stack(
             network_env.push((k, v));
         }
     }
-    tasks.spawn(services::supervise(
-        Spec { name: "network", memory_mb: cfg.memory_mb("network"), program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    specs.push(Spec { name: "network", memory_mb: cfg.memory_mb("network"), program: paths.network(), args: vec![], env: network_env, cwd: cwd.clone() });
     let joins = |name: &str| -> Vec<(String, String)> {
         owned(&[
             ("NETWORK_URL", network_url.clone()),
@@ -208,8 +207,7 @@ async fn run_stack(
     if tcc {
         let dir = paths.data.join("tcc");
         std::fs::create_dir_all(&dir)?;
-        tasks.spawn(services::supervise(
-            Spec {
+        specs.push(Spec {
                 name: "tcc", memory_mb: cfg.memory_mb("tcc"),
                 program: paths.tcc(),
                 args: vec![],
@@ -232,14 +230,11 @@ async fn run_stack(
                 ]), bun_heap(cfg.memory_mb("tcc"))]
                 .concat(),
                 cwd: dir,
-            },
-            state_rx.clone(),
-        ));
+            });
     }
 
     // importer: reads, validates and saves product spreadsheets queued in the importacoes table
-    tasks.spawn(services::supervise(
-        Spec {
+    specs.push(Spec {
             name: "importer", memory_mb: cfg.memory_mb("importer"),
             program: paths.importer(),
             args: vec![],
@@ -261,9 +256,7 @@ async fn run_stack(
             .chain(joins("importer"))
             .collect(),
             cwd: cwd.clone(),
-        },
-        state_rx.clone(),
-    ));
+        });
 
     // vault: the usuarios' CPF and birth dates, AES-256-GCM under keys in data/vault-keys. On Windows the
     // keys are DPAPI blobs bound to this Windows account: the folder copied to another machine or user
@@ -274,8 +267,7 @@ async fn run_stack(
         use sha2::{Digest, Sha256};
         Sha256::digest(secrets.vault_token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    tasks.spawn(services::supervise(
-        Spec {
+    specs.push(Spec {
             name: "vault", memory_mb: cfg.memory_mb("vault"),
             program: paths.vault(),
             args: vec!["serve".into()],
@@ -295,9 +287,7 @@ async fn run_stack(
                 ("VAULT_ENV", "development".into()),
             ]),
             cwd: cwd.clone(),
-        },
-        state_rx.clone(),
-    ));
+        });
 
     // api: defaults, then config/api.env, then what the launcher owns (as in docker-compose.yml, the
     // database, host/port, URLs and CORS always win over the file)
@@ -365,10 +355,7 @@ async fn run_stack(
     }
     api_env.extend(joins("api"));
     api_env.extend(bun_heap(cfg.memory_mb("api")));
-    tasks.spawn(services::supervise(
-        Spec { name: "api", memory_mb: cfg.memory_mb("api"), program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() },
-        state_rx.clone(),
-    ));
+    specs.push(Spec { name: "api", memory_mb: cfg.memory_mb("api"), program: paths.api(), args: vec![], env: api_env, cwd: cwd.clone() });
 
     // erp-cache: the read cache (erp-v1/cache) in front of the API (site "erp", registered as api-cache,
     // which the gateway's /api goes to) and the TCC server (site "tcc", which also answers resent
@@ -393,16 +380,13 @@ async fn run_stack(
             ("TCC_TELEMETRY_URL", if tcc { format!("{}/telemetry/host", cfg.tcc_url()) } else { String::new() }),
             ("TCC_TOKEN", secrets.tcc_token.clone()),
         ]));
-        tasks.spawn(services::supervise(
-            Spec {
+        specs.push(Spec {
                 name: "cache", memory_mb: cfg.memory_mb("cache"),
                 program: paths.cache(),
                 args: vec![],
                 env,
                 cwd: cwd.clone(),
-            },
-            state_rx.clone(),
-        ));
+            });
     }
 
     // billing: Stripe webhooks; its Flyway migrations run in the billing schema of the same database
@@ -423,8 +407,7 @@ async fn run_stack(
             ("SERVER_FORWARD_HEADERS_STRATEGY", "framework".into()),
         ]));
         env.extend(joins("billing"));
-        tasks.spawn(services::supervise(
-            Spec {
+        specs.push(Spec {
                 name: "billing", memory_mb: cfg.memory_mb("billing"),
                 program: paths.billing_java(),
                 // JVM limits before -jar (heap, metaspace, direct buffers); the job object is the final bound
@@ -435,9 +418,19 @@ async fn run_stack(
                     .collect(),
                 env,
                 cwd: cwd.clone(),
-            },
-            state_rx.clone(),
-        ));
+            });
+    }
+
+    // polyvisor, when shipped, is the one process the launcher starts: it runs the services above in their
+    // job objects (see polyvisor.rs); otherwise each Spec is supervised here, in its own job
+    if cfg.polyvisor && paths.polyvisor().exists() {
+        let file = polyvisor::write_config(paths, cfg, &specs)?;
+        log("launcher", &format!("handing {} services to polyvisor ({})", specs.len(), file.display()));
+        tasks.spawn(services::supervise(polyvisor::spec(paths, file), state_rx.clone()));
+    } else {
+        for spec in specs {
+            tasks.spawn(services::supervise(spec, state_rx.clone()));
+        }
     }
 
     let banner = {

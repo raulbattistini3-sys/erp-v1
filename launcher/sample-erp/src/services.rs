@@ -52,7 +52,13 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
         #[cfg(not(windows))]
         let job: Option<String> = None;
         starts += 1;
-        let mut child = match Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        // limited: started suspended, resumed once it is in its job (see windows::CREATE_SUSPENDED)
+        #[cfg(windows)]
+        if spec.memory_mb > 0 {
+            command.creation_flags(crate::windows::CREATE_SUSPENDED);
+        }
+        let mut child = match command
             .args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .envs(job.iter().map(|n| ("WIN_TELEMETRY_JOB", n)))
@@ -89,6 +95,13 @@ pub async fn supervise(spec: Spec, mut state: watch::Receiver<State>) {
                 }
             },
         };
+        #[cfg(windows)]
+        if let Some(pid) = child.id().filter(|_| spec.memory_mb > 0) {
+            if let Err(e) = crate::windows::resume(pid) {
+                crate::log(spec.name, &format!("could not resume the process: {e}"));
+                let _ = child.kill().await;
+            }
+        }
         let started = Instant::now();
 
         tokio::select! {
@@ -124,7 +137,13 @@ fn forward(name: &'static str, stream: Option<impl AsyncRead + Unpin + Send + 's
         let mut lines = BufReader::new(stream).split(b'\n');
         while let Ok(Some(line)) = lines.next_segment().await {
             let line = String::from_utf8_lossy(&line);
-            crate::log(name, line.trim_end_matches('\r'));
+            let line = line.trim_end_matches('\r');
+            if name == "polyvisor" && line.contains(" | ") {
+                // already "service | line" from polyvisor
+                println!("{line}");
+            } else {
+                crate::log(name, line);
+            }
         }
     });
 }
